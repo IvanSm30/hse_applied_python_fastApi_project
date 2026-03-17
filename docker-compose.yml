@@ -50,27 +50,6 @@ services:
       - app-network
     tty: true
 
-  frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: frontend
-    working_dir: /app/app
-    command: uv run streamlit run main.py --server.address 0.0.0.0 --server.port 8501
-    ports:
-      - "8501:8501"
-    environment:
-      - BACKEND_URL=http://backend:8000
-    volumes:
-      - .:/app
-      - /app/.venv
-      - uv_cache:/root/.cache/uv
-    depends_on:
-      - backend
-    networks:
-      - app-network
-    tty: true
-
 volumes:
   postgres_data:
   uv_cache:

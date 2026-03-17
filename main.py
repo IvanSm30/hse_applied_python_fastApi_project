@@ -1,179 +1,249 @@
-from sqlalchemy import select
-from fastapi import FastAPI, Depends, HTTPException, status, Response
-from fastapi.responses import RedirectResponse
-from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel, Field, validator
-from datetime import datetime, timezone, timedelta
-from typing import Optional, List
-import uuid
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Optional
 
-from database import get_db, close_connections
-from crud import create_link, get_link, delete_link, update_link, search_links
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+
+from database import get_db, init_models, close_connections, rdb
+from crud import create_link, get_link, delete_link, update_link
 from models import Link
 
-app = FastAPI(
-    title="URL Shortener API",
-    description="Async URL Shortener with FastAPI, SQLAlchemy & Redis",
-    version="1.0.0",
-)
+REDIS_LINK_PREFIX = "link:"
+REDIS_TTL_SECONDS = int(timedelta(hours=24).total_seconds())
+
+
+def get_cache_key(short_code: str) -> str:
+    return f"{REDIS_LINK_PREFIX}{short_code}"
+
+
+def serialize_link_for_cache(link: Link) -> str:
+    return json.dumps(
+        {
+            "id": link.id,
+            "original_url": link.original_url,
+            "short_code": link.short_code,
+            "click_count": link.click_count,
+            "created_at": link.created_at.isoformat() if link.created_at else None,
+            "expires_at": link.expires_at.isoformat() if link.expires_at else None,
+            "last_used_at": (
+                link.last_used_at.isoformat() if link.last_used_at else None
+            ),
+            "is_anonymous": link.is_anonymous,
+            "deleted_at": link.deleted_at.isoformat() if link.deleted_at else None,
+        },
+        default=str,
+    )
+
+
+def deserialize_link_from_cache(data: str) -> Optional[dict]:
+    try:
+        return json.loads(data)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 class LinkCreate(BaseModel):
-    original_url: str = Field(..., description="Оригинальный URL")
-    custom_alias: Optional[str] = Field(
-        None, min_length=4, max_length=10, pattern=r"^[a-zA-Z0-9]+$"
-    )
-    expires_in_days: Optional[int] = Field(
-        None, ge=1, le=365, description="Срок жизни в днях"
-    )
+    original_url: str
+    custom_alias: Optional[str] = None
+    expires_at: Optional[datetime] = None
 
-    @validator("original_url")
-    def validate_url(cls, v):
-        if not v.startswith(("http://", "https://")):
-            v = "https://" + v
-        return v
+
+class LinkUpdate(BaseModel):
+    new_url: str
 
 
 class LinkResponse(BaseModel):
-    id: uuid.UUID
     short_code: str
     original_url: str
+    click_count: int
     created_at: datetime
-    expires_at: Optional[datetime] = None
-    click_count: int = 0
+    expires_at: Optional[datetime]
+    last_used_at: Optional[datetime]
     is_anonymous: bool
 
     class Config:
         from_attributes = True
 
 
-class LinkStats(BaseModel):
+class LinkStatsResponse(BaseModel):
     short_code: str
     original_url: str
     click_count: int
     created_at: datetime
-    last_used_at: Optional[datetime] = None
-    expires_at: Optional[datetime] = None
-    is_active: bool
+    last_used_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
 
 
-class LinkUpdate(BaseModel):
-    original_url: str = Field(..., description="Новый оригинальный URL")
-
-    @validator("original_url")
-    def validate_url(cls, v):
-        if not v.startswith(("http://", "https://")):
-            v = "https://" + v
-        return v
+async def invalidate_link_cache(short_code: str):
+    cache_key = get_cache_key(short_code)
+    await rdb.delete(cache_key)
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
+async def cache_link(link: Link):
+    cache_key = get_cache_key(link.short_code)
+    serialized = serialize_link_for_cache(link)
+    await rdb.setex(cache_key, REDIS_TTL_SECONDS, serialized)
+
+
+async def get_cached_link(short_code: str) -> Optional[dict]:
+    cache_key = get_cache_key(short_code)
+    cached = await rdb.get(cache_key)
+    if cached:
+        return deserialize_link_from_cache(cached)
+    return None
+
+
+async def increment_click_count_in_background(short_code: str, db: AsyncSession):
+    try:
+        await db.execute(
+            update(Link)
+            .where(Link.short_code == short_code, Link.deleted_at.is_(None))
+            .values(
+                click_count=Link.click_count + 1,
+                last_used_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+
+        result = await db.execute(
+            select(Link).where(Link.short_code == short_code, Link.deleted_at.is_(None))
+        )
+        updated_link = result.scalar_one_or_none()
+        if updated_link:
+            await cache_link(updated_link)
+    except Exception as e:
+        print(f"⚠️ Failed to update click count for {short_code}: {e}")
+        await db.rollback()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_models()
+    yield
     await close_connections()
 
 
-@app.post(
-    "/links/shorten", response_model=LinkResponse, status_code=status.HTTP_201_CREATED
-)
-async def create_short_link(link_data: LinkCreate, db: AsyncSession = Depends(get_db)):
-    expires_at = None
-    if link_data.expires_in_days:
-        expires_at = datetime.now(timezone.utc) + timedelta(
-            days=link_data.expires_in_days
-        )
+app = FastAPI(lifespan=lifespan, title="URL Shortener API")
 
+
+@app.post("/links/shorten", response_model=LinkResponse, status_code=201)
+async def create_short_link(body: LinkCreate, db: AsyncSession = Depends(get_db)):
     try:
         link = await create_link(
-            original_url=link_data.original_url,
-            custom_alias=link_data.custom_alias,
-            expires_at=expires_at,
+            original_url=body.original_url,
+            custom_alias=body.custom_alias,
+            expires_at=body.expires_at,
             user_id=None,
         )
+        await cache_link(link)
         return link
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Server error: {str(e)}",
-        )
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/links/{short_code}")
 async def redirect_to_short_link(short_code: str, db: AsyncSession = Depends(get_db)):
+    cached = await get_cached_link(short_code)
+
+    if cached and not cached.get("deleted_at"):
+        expires_at = cached.get("expires_at")
+        if expires_at:
+            try:
+                if datetime.fromisoformat(expires_at) < datetime.utcnow():
+                    raise HTTPException(status_code=410, detail="Link has expired")
+            except ValueError:
+                pass
+
+        asyncio.create_task(increment_click_count_in_background(short_code, db))
+
+        return RedirectResponse(url=cached["original_url"])
+
     link = await get_link(short_code, db)
-
     if not link:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Link not found or expired"
-        )
+        raise HTTPException(status_code=404, detail="Link not found or expired")
 
-    return RedirectResponse(url=link.original_url, status_code=307)
+    await cache_link(link)
+
+    asyncio.create_task(increment_click_count_in_background(short_code, db))
+
+    return RedirectResponse(url=link.original_url)
 
 
-@app.delete("/links/{short_code}", status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/links/{short_code}")
 async def delete_short_link(short_code: str, db: AsyncSession = Depends(get_db)):
     success = await delete_link(short_code, user_id=None, db=db)
-
     if not success:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Link not found or you don't have permission to delete it",
-        )
+        raise HTTPException(status_code=404, detail="Link not found")
 
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    await invalidate_link_cache(short_code)
+
+    return {"message": "Link deleted successfully"}
 
 
 @app.put("/links/{short_code}", response_model=LinkResponse)
 async def update_short_link(
-    short_code: str, link_data: LinkUpdate, db: AsyncSession = Depends(get_db)
+    short_code: str, body: LinkUpdate, db: AsyncSession = Depends(get_db)
 ):
     try:
         link = await update_link(
-            short_code=short_code, new_url=link_data.original_url, user_id=None, db=db
+            short_code=short_code, new_url=body.new_url, user_id=None, db=db
         )
+        await invalidate_link_cache(short_code)
+        await cache_link(link)
         return link
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/links/{short_code}/stats", response_model=LinkStatsResponse)
+async def get_stats_short_link(short_code: str, db: AsyncSession = Depends(get_db)):
+    cached = await get_cached_link(short_code)
+
+    if cached and not cached.get("deleted_at"):
+        return LinkStatsResponse(
+            short_code=cached["short_code"],
+            original_url=cached["original_url"],
+            click_count=cached["click_count"],
+            created_at=datetime.fromisoformat(cached["created_at"])
+            if cached.get("created_at")
+            else datetime.utcnow(),
+            last_used_at=(
+                datetime.fromisoformat(cached["last_used_at"])
+                if cached.get("last_used_at")
+                else None
+            ),
         )
 
-
-@app.get("/links/{short_code}/stats", response_model=LinkStats)
-async def get_stats_short_link(short_code: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Link).where(Link.short_code == short_code, Link.deleted_at.is_(None))
     )
     link = result.scalar_one_or_none()
 
     if not link:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Link not found"
-        )
+        raise HTTPException(status_code=404, detail="Link not found")
 
-    is_active = True
-    if link.expires_at and link.expires_at < datetime.now(timezone.utc):
-        is_active = False
-
-    return LinkStats(
-        short_code=link.short_code,
-        original_url=link.original_url,
-        click_count=link.click_count,
-        created_at=link.created_at,
-        last_used_at=link.last_used_at,
-        expires_at=link.expires_at,
-        is_active=is_active,
-    )
-
-
-@app.get("/links/", response_model=List[LinkResponse])
-async def list_links(db: AsyncSession = Depends(get_db)):
-    links = await search_links(original_url=None, user_id=None, db=db)
-    return links
+    return link
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+    """Проверка работоспособности приложения и соединений"""
+    health = {"status": "ok", "services": {}}
+
+    try:
+        await rdb.ping()
+        health["services"]["redis"] = "connected"
+    except Exception as e:
+        health["services"]["redis"] = f"error: {str(e)}"
+
+    health["services"]["database"] = "configured"
+
+    return health
