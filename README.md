@@ -6,10 +6,12 @@
 2. `uv sync`
 3. `source .venv/bin/activate` – macos, `.venv\Scripts\activate` – windows
 
-### Backend FastAPI
+# Dev mode
+### FastAPI App
 
 1. `uv run uvicorn main:app --reload`
 
-### Frontend Streamlit
+# Prod mode
+### FastAPI App
 
-1. `uv run streamlit run main.py`
+1. `docker-compose up --build`
